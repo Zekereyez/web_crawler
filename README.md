@@ -13,8 +13,11 @@ be **correct, robust, and observable** while staying easy to read end-to-end.
 - Bounded retries on `Retry-After`
 - Metrics snapshot at end of run
 
-See [`DESIGN.md`](./DESIGN.md) for the architecture diagram, schemas, and the
-sequence flow of a single request.
+Docs:
+- **[`GUIDE.md`](./GUIDE.md)** — walkthrough for a new engineer / interview
+  prep: how you'd arrive at this solution from scratch, one problem at a time.
+- **[`DESIGN.md`](./DESIGN.md)** — reference doc: architecture diagram,
+  data schemas, sequence + state diagrams.
 
 ## Install
 
