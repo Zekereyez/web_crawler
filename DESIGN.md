@@ -1,30 +1,38 @@
 # Design doc: concurrent web crawler
 
-Companion to [README.md](./README.md). This document covers the architecture,
-the data schemas, and the flow of a single URL through the system.
+Companion to [README.md](./README.md). This document is the reference for the
+architecture, the data schemas, and the path a single URL takes through the
+system.
 
 ---
 
 ## 1. Goals and non-goals
 
-**Goals**
-- Fetch many URLs concurrently on one machine, up to ~10^6 unique URLs per
-  run.
-- Never crash on a bad page or a bad host.
-- Be a good citizen: robots.txt, per-host rate limiting, Retry-After.
-- Terminate deterministically. No "queue looks empty, we must be done."
-- Be testable and observable end to end.
+Goals:
 
-**Non-goals** (called out to bound scope)
-- Distributed crawling across machines.
-- Persistent frontier or crash recovery mid-run.
-- JavaScript rendering. We parse static HTML only.
-- Indexing or full-text search. We emit a link graph plus status; downstream
-  consumers do what they want with it.
+- Fetch up to ~10^6 unique URLs per run, concurrently, on one machine.
+- Survive bad pages and bad hosts without crashing.
+- Respect `robots.txt`, per-host rate limits, and `Retry-After`.
+- Terminate on quiescence, not on an apparent empty queue.
+- Cover the concurrent paths with tests and metrics.
+
+Non-goals, set to bound scope:
+
+- Crawling across machines.
+- A persistent frontier, or crash recovery mid-run.
+- JavaScript rendering. The crawler parses static HTML only.
+- Indexing and full-text search. The output is a link graph and a status per
+  URL. Downstream consumers do the rest.
 
 ---
 
 ## 2. Architecture
+
+The CLI parses arguments into a `CrawlerConfig`, then hands seeds to the
+`Crawler`. The `Crawler` owns three pieces of shared state (`_seen`,
+`_results`, and the `Frontier`) and a fixed thread pool of workers. Each
+worker pulls one URL, runs it through robots, rate limiting, fetch, and
+link extraction, and enqueues its children back on the same frontier.
 
 ```
                         ┌──────────────────────────────────────┐
@@ -64,15 +72,18 @@ the data schemas, and the flow of a single URL through the system.
                      CrawlResult { pages, metrics }
 ```
 
-Each component is one file, one responsibility. Locking is local to the
-component that owns the state; components communicate only through their
-public methods.
+Each component is one file with one responsibility. Locks live in the
+component that owns the state. Components only talk to each other through
+their public methods.
 
 ---
 
 ## 3. Data schemas
 
-### 3.1 `CrawlerConfig`, the immutable run config
+### 3.1 `CrawlerConfig`: immutable run parameters
+
+`CrawlerConfig` is a frozen dataclass. The `Crawler` reads it. No worker
+writes back to it.
 
 ```python
 CrawlerConfig(
@@ -85,28 +96,35 @@ CrawlerConfig(
     per_host_delay: float         # min seconds between same-host requests
     respect_robots: bool
     max_retry_after: float        # cap on Retry-After we'll honor
-    max_retries: int              # 429/503 retries per URL
+    max_retries: int              # retries per URL on 429 or 503
     user_agent: str
     allowed_content_types: tuple  # e.g. ("text/html", "application/xhtml+xml")
 )
 ```
 
-### 3.2 `Item`, the frontier element
+### 3.2 `Item`: one frontier entry
+
+Each queued URL is one `Item`. The `url` field is already canonical, so it
+doubles as the dedup key.
 
 ```python
 Item(
     url: str          # already-canonicalized (dedup key)
     depth: int        # 0 for seed
-    attempts: int     # incremented on 429/503 retry
+    attempts: int     # incremented on retry after 429 or 503
 )
 ```
 
-### 3.3 `FetchResult`, the fetcher output
+### 3.3 `FetchResult`: what the `Fetcher` returns
+
+`FetchResult` carries a status of 0 for a network error and the real HTTP
+status otherwise. A `body` of `None` means the fetcher chose not to
+download it: filtered by content-type, over `max_bytes`, or non-HTML.
 
 ```python
 FetchResult(
     final_url: str            # post-redirect URL from `requests`
-    status: int               # 0 = network error, else HTTP status
+    status: int               # 0 for network error, else HTTP status
     content_type: str         # lowercased, ";..." stripped
     body: Optional[str]       # None if filtered, oversized, or non-HTML
     retry_after: Optional[float]
@@ -114,7 +132,11 @@ FetchResult(
 )
 ```
 
-### 3.4 `CrawlResult`, the end-of-run summary
+### 3.4 `CrawlResult`: the end-of-run summary
+
+One `CrawlResult` is returned to the caller. `pages` is keyed by canonical
+URL. `metrics` is the full counter snapshot. Field names match the alert
+names in [README §Observability](./README.md#observability).
 
 ```python
 CrawlResult:
@@ -128,21 +150,40 @@ CrawlResult:
   }
 ```
 
-### 3.5 Internal shared state
+### 3.5 Shared state and its guards
+
+Every piece of mutable shared state lives in one component under one lock.
+No lock is taken across component boundaries.
 
 | State | Owner | Guard | Purpose |
 | --- | --- | --- | --- |
-| `_seen: set[str]` | `Crawler` | `_seen_lock` | canonical URL dedup |
-| `_results: dict` | `Crawler` | `_results_lock` | record per URL |
-| queue + `in_flight: int` | `Frontier` | `queue.Queue` lock + `_lock` | frontier + quiescence |
-| `_next_time: dict[host, float]` | `HostRateLimiter` | `_lock` | per-host next-allowed |
-| `_delay_overrides: dict[host, float]` | `HostRateLimiter` | `_lock` | crawl-delay upgrades |
-| `_cache: dict[host_key, (Parser, delay)]` | `RobotsCache` | `_cache_lock` | robots memoization |
-| `_host_locks: dict[host_key, Lock]` | `RobotsCache` | `_host_locks_lock` | prevent thundering herd |
+| `_seen: set[str]` | `Crawler` | `_seen_lock` | Canonical URL dedup. |
+| `_results: dict` | `Crawler` | `_results_lock` | One record per URL. |
+| queue and `in_flight: int` | `Frontier` | `queue.Queue` lock, `_lock` | Frontier and quiescence. |
+| `_next_time: dict[host, float]` | `HostRateLimiter` | `_lock` | Next allowed time per host. |
+| `_delay_overrides: dict[host, float]` | `HostRateLimiter` | `_lock` | Crawl-delay upgrades. |
+| `_cache: dict[host_key, (Parser, delay)]` | `RobotsCache` | `_cache_lock` | Robots memoization. |
+| `_host_locks: dict[host_key, Lock]` | `RobotsCache` | `_host_locks_lock` | Prevent thundering herd on first fetch. |
 
 ---
 
 ## 4. Sequence flow: one URL through the system
+
+The worker calls six components in a fixed order:
+
+1. `RobotsCache.can_fetch(url)`. If the host disallows the URL, the worker
+   records it and returns.
+2. `RobotsCache.crawl_delay(host)`. If robots names a delay, feed it to the
+   rate limiter as a per-host upgrade.
+3. `HostRateLimiter.acquire(host)`. Compute the wait under a lock, then
+   sleep outside the lock.
+4. `Fetcher.fetch(url)`. Stream the response with a content-type check and
+   a byte cap.
+5. `Parser.extract_links(body)`. Return whatever links parsed cleanly.
+6. `Frontier.put(child)`, once per surviving link. Same-origin and
+   `_mark_seen` filter first.
+
+The diagram below shows the same flow as swim lanes.
 
 ```
 ┌────────┐   ┌──────────┐   ┌────────┐   ┌─────────────┐   ┌──────────┐   ┌────────┐   ┌───────────┐
@@ -191,7 +232,8 @@ CrawlResult:
 
 ## 5. Dedup logic: where and how
 
-There is exactly one canonical URL string per URL, and one set to dedup on:
+Dedup uses one canonical string per URL and one shared set. `_mark_seen`
+does both the check and the add under `_seen_lock`.
 
 ```
                        ┌────────────────┐
@@ -213,27 +255,32 @@ There is exactly one canonical URL string per URL, and one set to dedup on:
                           Frontier.put(Item)
 ```
 
-Two moments call `_mark_seen`:
+`_mark_seen` is called at two moments:
 
-1. **Enqueue time.** Before `frontier.put` for every discovered link and
-   every seed.
-2. **After a fetch that redirected.** If `final_canonical != request_canonical`,
-   we `_mark_seen(final_canonical)`. If it's already in `_seen`, the redirect
-   target was fetched by another route, so we drop this response without
-   recording it.
+1. **At enqueue time.** Before `frontier.put`, for every discovered link
+   and every seed.
+2. **After a redirect.** If `final_canonical != request_canonical`, the
+   worker calls `_mark_seen(final_canonical)`. If the target is already in
+   `_seen`, another path recorded it first, and the worker drops this
+   response.
 
-This handles all four dedup cases:
-- Same URL enqueued twice. The 2nd fails the `_seen` check.
-- Two URLs that differ only in fragment, ordering, or case. They collapse via
-  canonicalization.
-- Redirect chain lands on an already-seen URL. The 2nd path drops the
-  response.
-- Two URLs whose canonical forms both redirect to X. Whichever finishes first
-  records X; the other returns after `_mark_seen(X)` fails.
+Those two checks cover four cases:
+
+- The same URL is enqueued twice. The second attempt fails `_seen`.
+- Two URLs differ only in fragment, query ordering, or case. Canonicalization
+  collapses them.
+- A redirect chain lands on a URL that another worker already fetched. The
+  redirected path drops its response.
+- Two distinct canonical URLs redirect to the same target X. The first
+  finisher records X. The second returns after `_mark_seen(X)` fails.
 
 ---
 
 ## 6. URL state machine
+
+A URL moves through three states: `QUEUED`, `IN_FLIGHT`, and `DONE`. The
+diagram lists the four ways `IN_FLIGHT` can end and the one path back to
+`QUEUED`.
 
 ```
                        enqueue()
@@ -272,13 +319,18 @@ This handles all four dedup cases:
                                           ────────► back to QUEUED
 ```
 
-`in_flight` is incremented on `put` and decremented on `task_done`. It
-counts (queue length) + (workers currently in `_process`), so as long as
-either is non-zero, the crawl is still live.
+`put` increments `in_flight`. `task_done` decrements it. The counter
+equals the queue length plus the number of workers currently in
+`_process`. While either is non-zero, the crawl is live.
 
 ---
 
 ## 7. Termination flow
+
+The main thread blocks on the frontier's `done` Event. Workers `put` and
+`task_done` on every item. When `in_flight` reaches zero, the frontier sets
+the event, the main thread flips `stop_event`, and the workers drop out of
+their poll loop on the next `get` timeout.
 
 ```
 Main thread                     Workers                  Frontier
@@ -307,46 +359,53 @@ Main thread                     Workers                  Frontier
      ▼                              ▼                        ▼
 ```
 
-Two additional exit paths use the same latch:
+Two more exit paths share the same latch:
 
 - **`max_pages` reached.** `_mark_seen` calls `frontier.trigger_stop()`,
-  which sets the Event directly. Workers finish their current item and exit.
-  `put()` after `trigger_stop` is a no-op.
-- **Worker exception.** Caught in `_worker_loop` and counted in metrics; the
-  worker keeps running. Exceptions never propagate.
+  which sets the event directly. Workers finish their current item and
+  exit. Any `put()` after `trigger_stop` is a no-op.
+- **Worker exception.** The exception is caught in `_worker_loop` and
+  counted in `worker_exceptions`. The worker keeps running. Exceptions
+  never propagate out of a worker.
 
 ---
 
 ## 8. Failure modes and how they're handled
 
+Each row is one failure with the code that catches it and the counter that
+records it. Every path ends in a `DONE` URL or a re-enqueue. Nothing leaks.
+
 | Failure | Handling |
 | --- | --- |
-| Timeout / connection error | `FetchResult(status=0, error=...)`; metric `network_errors`; URL is DONE. |
-| Non-HTML content-type | Body not downloaded; page recorded with empty links. |
-| Oversized body (`Content-Length` or streamed size > cap) | Bail during stream; connection is closed via `with resp:`; no leak. |
-| Malformed HTML | `HTMLParser.feed` in try/except; we return whatever links we got. |
-| Bad worker exception | Caught at loop top; metric `worker_exceptions`; worker keeps going. |
-| robots.txt 5xx / network error | Fail closed for that host (Disallow: /). |
-| robots.txt 4xx | Fail open (allow all). |
-| `Crawl-delay` smaller than default | `max(default, override)`, so the default wins. |
-| Redirect to an already-seen URL | `_mark_seen(final)` returns False; response dropped without recording. |
-| Redirect to a different origin (same-origin mode) | Rejected after redirect. |
-| Crawler trap (`/loop?p=1 → /loop?p=2 → ...`) | Depth cap plus `max_pages` cap; each canonical URL is fetched at most once. |
+| Timeout or connection error | `FetchResult(status=0, error=...)`. Counted in `network_errors`. URL is `DONE`. |
+| Non-HTML content-type | The body is never downloaded. The page is recorded with empty links. |
+| Oversized body (`Content-Length` or streamed size over cap) | The fetcher bails during the stream. The `with resp:` block closes the socket. |
+| Malformed HTML | `HTMLParser.feed` runs in a try/except. The parser returns whatever links it got. |
+| Uncaught worker exception | Caught at the top of `_worker_loop`. Counted in `worker_exceptions`. The worker keeps going. |
+| robots.txt 5xx or network error | Fail closed for that host: `Disallow: /`. |
+| robots.txt 4xx | Fail open: allow all. |
+| `Crawl-delay` smaller than the default | The rate limiter uses `max(default, override)`, so the default wins. |
+| Redirect to an already-seen URL | `_mark_seen(final)` returns `False`. The response is dropped without recording. |
+| Redirect to a different origin, in same-origin mode | Rejected after redirect. |
+| Crawler trap (`/loop?p=1 → /loop?p=2 → ...`) | Depth cap and `max_pages` cap. Each canonical URL is fetched at most once. |
 
 ---
 
 ## 9. Observability contract
 
-Every run produces:
+Every run produces two things:
 
-- **Logs.** INFO on start and stop, WARNING on unparseable seeds, DEBUG on
-  fetch and robots errors.
-- **Metrics snapshot.** See `CrawlResult.metrics` in §3.4.
+- **Logs.** `INFO` on start and stop. `WARNING` on unparseable seeds.
+  `DEBUG` on fetch errors and robots errors.
+- **A metrics snapshot.** The field names in `CrawlResult.metrics` (see
+  §3.4) match the alert names in
+  [README §Observability](./README.md#observability).
 
-In production I would additionally export:
-- Fetch latency histograms, per-host and global.
-- A gauge for `frontier_size` and `in_flight`.
-- Alerts (see [README §Observability](./README.md#observability)).
+Production would also export three things not in this repo:
+
+- Fetch latency histograms, per host and global.
+- A gauge for `frontier_size` and one for `in_flight`.
+- The alerts listed in [README §Observability](./README.md#observability).
 
 ---
 
@@ -354,15 +413,15 @@ In production I would additionally export:
 
 | Layer | Test | Purpose |
 | --- | --- | --- |
-| unit | `test_normalizer` | scheme/host case, default ports, fragment, query order, relative, junk |
-| unit | `test_rate_limiter` | spacing, per-host independence, override precedence, on a fake clock (no real sleep) |
-| unit | `test_frontier` | quiescence with mid-processing enqueues, stop-wakes-waiter, put-after-stop |
-| unit | `test_parser` | link extraction, nofollow, broken HTML tolerance |
-| integration | `test_crawler` | end-to-end against local `http.server`: same-origin, robots, redirect fold, page cap, oversized body |
+| unit | `test_normalizer` | Scheme and host case, default ports, fragment, query order, relative URLs, junk input. |
+| unit | `test_rate_limiter` | Spacing, per-host independence, and override precedence, on a fake clock. No real sleep. |
+| unit | `test_frontier` | Quiescence with mid-processing enqueues, stop wakes a waiter, put after stop is a no-op. |
+| unit | `test_parser` | Link extraction, `rel="nofollow"`, tolerance of broken HTML. |
+| integration | `test_crawler` | End-to-end against a local `http.server`: same-origin, robots, redirect fold, page cap, oversized body. |
 
-Concurrency-specific properties are covered by `test_frontier` (in-flight
-tracking is the load-bearing invariant) and by the end-to-end test running
-with `max_workers=4`.
+Two tests cover the concurrent paths. `test_frontier` pins the in-flight
+invariant, which is the one load-bearing correctness property.
+`test_crawler` runs the whole crawler with `max_workers=4`.
 
 ---
 
@@ -370,27 +429,31 @@ with `max_workers=4`.
 
 | Scale | First bottleneck | Fix |
 | --- | --- | --- |
-| 10x (10^5 URLs) | Nothing structural, just runtime. | Bump `max_workers`, tune `per_host_delay` per target. |
-| 100x (10^6 URLs) | `_seen: set[str]` RAM (~130 MB), `_results` grows large. | Move `_results` to a streaming writer (JSONL to disk). |
-| 1000x (10^7+ URLs) | `_seen` no longer fits comfortably; the frontier is in-memory (no restart recovery); per-host politeness is process-local. | Bloom filter plus an on-disk exact set (sqlite or rocksdb); durable frontier (SQS or Redis); consistent-hash by host across N crawler nodes so per-host politeness stays correct. |
+| 10x (10^5 URLs) | Nothing structural. Only runtime. | Raise `max_workers`. Tune `per_host_delay` per target. |
+| 100x (10^6 URLs) | `_seen: set[str]` uses ~130 MB. `_results` grows large. | Move `_results` to a streaming JSONL writer on disk. |
+| 1000x (10^7+ URLs) | `_seen` no longer fits comfortably. The frontier is in-memory, so a restart loses the run. Per-host politeness is process-local. | Back `_seen` with a bloom filter plus an on-disk exact set (sqlite or rocksdb). Move the frontier to a durable queue (SQS or Redis). Consistent-hash by host across N crawler nodes so per-host politeness stays correct. |
 
-Past a single machine, the interesting design question is *who owns a host*.
-Per-host politeness only holds if all requests to `example.com` are
-serialized through one node. Consistent hashing on the canonical host solves
-it cleanly.
+Past a single machine, the load-bearing question is *who owns a host*.
+Per-host politeness only holds when every request to `example.com` is
+serialized through one node. Consistent hashing on the canonical host name
+gives one owner per host with no coordination.
 
 ---
 
 ## 12. Where `asyncio` beats threads, and where it doesn't
 
-Threads win here because:
-- The workload is dominated by network I/O, and blocking `recv()` is cheap.
-- Every dependency (`requests`, stdlib `RobotFileParser`, `HTMLParser`) is
-  synchronous. Mixing sync-in-async without pooling defeats the point.
-- Debugging and testing threaded code with proper locks is well understood.
+Threads win here for three reasons:
 
-`asyncio` starts to pay off when you want tens of thousands of concurrent
-in-flight requests per process (threads run out of stack RAM around 10k) and
-you're willing to move the whole stack to async (`aiohttp`, an async robots
-implementation, an executor for CPU-bound parsing). For a single-machine
-crawler up to ~10^6 URLs, threads are the simpler correct choice.
+- Network I/O dominates the workload. A blocking `recv()` costs almost
+  nothing.
+- Every dependency in this repo is synchronous: `requests`, stdlib
+  `RobotFileParser`, `HTMLParser`. Calling any of them from an async
+  function without a thread pool blocks the event loop.
+- Threaded code with per-component locks is straightforward to debug and
+  test.
+
+`asyncio` starts to pay off past ~10,000 concurrent in-flight requests per
+process, where threads run out of stack RAM. The cost is moving the whole
+stack to async: `aiohttp` for HTTP, an async robots parser, and a thread
+pool for CPU-bound parsing anyway. For a single-machine crawler up to
+~10^6 URLs, threads are the simpler correct choice.
