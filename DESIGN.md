@@ -1,26 +1,25 @@
-# Design Doc — Concurrent Web Crawler
+# Design doc: concurrent web crawler
 
-Companion to [README.md](./README.md). This document draws out the
-architecture, the data schemas, and the flow of a single URL through the
-system.
+Companion to [README.md](./README.md). This document covers the architecture,
+the data schemas, and the flow of a single URL through the system.
 
 ---
 
-## 1. Goals & non-goals
+## 1. Goals and non-goals
 
 **Goals**
 - Fetch many URLs concurrently on one machine, up to ~10^6 unique URLs per
   run.
 - Never crash on a bad page or a bad host.
 - Be a good citizen: robots.txt, per-host rate limiting, Retry-After.
-- Deterministically terminate — no "queue looks empty, we must be done."
-- Be testable and observable end-to-end.
+- Terminate deterministically. No "queue looks empty, we must be done."
+- Be testable and observable end to end.
 
-**Non-goals (called out to bound scope)**
+**Non-goals** (called out to bound scope)
 - Distributed crawling across machines.
-- Persistent frontier / crash recovery mid-run.
-- JavaScript rendering (headless-browser); we parse static HTML only.
-- Indexing / full-text search. We emit a link graph + status; downstream
+- Persistent frontier or crash recovery mid-run.
+- JavaScript rendering. We parse static HTML only.
+- Indexing or full-text search. We emit a link graph plus status; downstream
   consumers do what they want with it.
 
 ---
@@ -73,7 +72,7 @@ public methods.
 
 ## 3. Data schemas
 
-### 3.1 `CrawlerConfig` — immutable run-config
+### 3.1 `CrawlerConfig`, the immutable run config
 
 ```python
 CrawlerConfig(
@@ -92,7 +91,7 @@ CrawlerConfig(
 )
 ```
 
-### 3.2 `Item` — frontier element
+### 3.2 `Item`, the frontier element
 
 ```python
 Item(
@@ -102,20 +101,20 @@ Item(
 )
 ```
 
-### 3.3 `FetchResult` — fetcher output
+### 3.3 `FetchResult`, the fetcher output
 
 ```python
 FetchResult(
     final_url: str            # post-redirect URL from `requests`
-    status: int               # 0 = network error; else HTTP status
+    status: int               # 0 = network error, else HTTP status
     content_type: str         # lowercased, ";..." stripped
-    body: Optional[str]       # None if filtered / oversized / non-HTML
+    body: Optional[str]       # None if filtered, oversized, or non-HTML
     retry_after: Optional[float]
     error: Optional[str]      # short reason on failure
 )
 ```
 
-### 3.4 `CrawlResult` — end-of-run summary
+### 3.4 `CrawlResult`, the end-of-run summary
 
 ```python
 CrawlResult:
@@ -143,7 +142,7 @@ CrawlResult:
 
 ---
 
-## 4. Sequence flow — one URL through the system
+## 4. Sequence flow: one URL through the system
 
 ```
 ┌────────┐   ┌──────────┐   ┌────────┐   ┌─────────────┐   ┌──────────┐   ┌────────┐   ┌───────────┐
@@ -190,9 +189,9 @@ CrawlResult:
 
 ---
 
-## 5. Dedup logic — where and how
+## 5. Dedup logic: where and how
 
-There is exactly one "canonical URL" string per URL, and one set to dedup on:
+There is exactly one canonical URL string per URL, and one set to dedup on:
 
 ```
                        ┌────────────────┐
@@ -216,20 +215,21 @@ There is exactly one "canonical URL" string per URL, and one set to dedup on:
 
 Two moments call `_mark_seen`:
 
-1. **Enqueue time**: before `frontier.put` for every discovered link and
+1. **Enqueue time.** Before `frontier.put` for every discovered link and
    every seed.
-2. **After a fetch that redirected**: if `final_canonical != request_canonical`,
-   we `_mark_seen(final_canonical)` — if it's already in `_seen`, the
-   redirect target was fetched by another route, so we drop this response
-   without recording it.
+2. **After a fetch that redirected.** If `final_canonical != request_canonical`,
+   we `_mark_seen(final_canonical)`. If it's already in `_seen`, the redirect
+   target was fetched by another route, so we drop this response without
+   recording it.
 
 This handles all four dedup cases:
-- Same URL enqueued twice → 2nd fails the `_seen` check.
-- Two URLs that differ only in fragment/ordering/case → collapse via
+- Same URL enqueued twice. The 2nd fails the `_seen` check.
+- Two URLs that differ only in fragment, ordering, or case. They collapse via
   canonicalization.
-- Redirect chain lands on an already-seen URL → 2nd path drops the response.
-- Two URLs whose canonical forms both redirect to X → whichever finishes
-  first records X; the other returns after `_mark_seen(X)` fails.
+- Redirect chain lands on an already-seen URL. The 2nd path drops the
+  response.
+- Two URLs whose canonical forms both redirect to X. Whichever finishes first
+  records X; the other returns after `_mark_seen(X)` fails.
 
 ---
 
@@ -309,11 +309,11 @@ Main thread                     Workers                  Frontier
 
 Two additional exit paths use the same latch:
 
-- **`max_pages` reached** — `_mark_seen` calls `frontier.trigger_stop()`,
-  which sets the Event directly. Workers finish their current item and
-  exit. `put()` after `trigger_stop` is a no-op.
-- **Worker exception** — caught in `_worker_loop`, counted in metrics, the
-  worker keeps running. It never propagates.
+- **`max_pages` reached.** `_mark_seen` calls `frontier.trigger_stop()`,
+  which sets the Event directly. Workers finish their current item and exit.
+  `put()` after `trigger_stop` is a no-op.
+- **Worker exception.** Caught in `_worker_loop` and counted in metrics; the
+  worker keeps running. Exceptions never propagate.
 
 ---
 
@@ -328,10 +328,10 @@ Two additional exit paths use the same latch:
 | Bad worker exception | Caught at loop top; metric `worker_exceptions`; worker keeps going. |
 | robots.txt 5xx / network error | Fail closed for that host (Disallow: /). |
 | robots.txt 4xx | Fail open (allow all). |
-| `Crawl-delay` smaller than default | `max(default, override)` — default wins. |
+| `Crawl-delay` smaller than default | `max(default, override)`, so the default wins. |
 | Redirect to an already-seen URL | `_mark_seen(final)` returns False; response dropped without recording. |
 | Redirect to a different origin (same-origin mode) | Rejected after redirect. |
-| Crawler trap (`/loop?p=1 → /loop?p=2 → …`) | Depth cap + `max_pages` cap; each canonical URL fetched at most once. |
+| Crawler trap (`/loop?p=1 → /loop?p=2 → ...`) | Depth cap plus `max_pages` cap; each canonical URL is fetched at most once. |
 
 ---
 
@@ -339,12 +339,12 @@ Two additional exit paths use the same latch:
 
 Every run produces:
 
-- **Logs** — INFO on start/stop, WARNING on unparseable seeds, DEBUG on
-  fetch errors and robots errors.
-- **Metrics snapshot** — see `CrawlResult.metrics` in §3.4.
+- **Logs.** INFO on start and stop, WARNING on unparseable seeds, DEBUG on
+  fetch and robots errors.
+- **Metrics snapshot.** See `CrawlResult.metrics` in §3.4.
 
 In production I would additionally export:
-- Histograms of fetch latency (per-host and global).
+- Fetch latency histograms, per-host and global.
 - A gauge for `frontier_size` and `in_flight`.
 - Alerts (see [README §Observability](./README.md#observability)).
 
@@ -355,42 +355,42 @@ In production I would additionally export:
 | Layer | Test | Purpose |
 | --- | --- | --- |
 | unit | `test_normalizer` | scheme/host case, default ports, fragment, query order, relative, junk |
-| unit | `test_rate_limiter` | spacing, per-host independence, override precedence — fake clock, no real sleep |
+| unit | `test_rate_limiter` | spacing, per-host independence, override precedence, on a fake clock (no real sleep) |
 | unit | `test_frontier` | quiescence with mid-processing enqueues, stop-wakes-waiter, put-after-stop |
 | unit | `test_parser` | link extraction, nofollow, broken HTML tolerance |
 | integration | `test_crawler` | end-to-end against local `http.server`: same-origin, robots, redirect fold, page cap, oversized body |
 
 Concurrency-specific properties are covered by `test_frontier` (in-flight
-tracking is the load-bearing invariant) and by the E2E test running with
-`max_workers=4`.
+tracking is the load-bearing invariant) and by the end-to-end test running
+with `max_workers=4`.
 
 ---
 
-## 11. What breaks first at 10× / 100× / 1000× scale
+## 11. What breaks first at 10x, 100x, 1000x scale
 
 | Scale | First bottleneck | Fix |
 | --- | --- | --- |
-| 10× (10^5 URLs) | Nothing structural; just runtime. | Bump `max_workers`, tune `per_host_delay` per target. |
-| 100× (10^6 URLs) | `_seen: set[str]` RAM (~130 MB), `_results` grows large. | Move `_results` to a streaming writer (JSONL to disk). |
-| 1000× (10^7+ URLs) | `_seen` no longer fits comfortably; frontier is in-memory (no restart recovery); per-host politeness is process-local. | Bloom filter + on-disk exact set (sqlite/rocksdb); durable frontier (SQS/Redis); consistent-hash by host across N crawler nodes so per-host politeness stays correct. |
+| 10x (10^5 URLs) | Nothing structural, just runtime. | Bump `max_workers`, tune `per_host_delay` per target. |
+| 100x (10^6 URLs) | `_seen: set[str]` RAM (~130 MB), `_results` grows large. | Move `_results` to a streaming writer (JSONL to disk). |
+| 1000x (10^7+ URLs) | `_seen` no longer fits comfortably; the frontier is in-memory (no restart recovery); per-host politeness is process-local. | Bloom filter plus an on-disk exact set (sqlite or rocksdb); durable frontier (SQS or Redis); consistent-hash by host across N crawler nodes so per-host politeness stays correct. |
 
-Beyond a single machine, the interesting design question is *who owns a host*
-— per-host politeness only holds if all requests to `example.com` are
-serialized through one node. Consistent hashing on the (canonical) host
-solves it cleanly.
+Past a single machine, the interesting design question is *who owns a host*.
+Per-host politeness only holds if all requests to `example.com` are
+serialized through one node. Consistent hashing on the canonical host solves
+it cleanly.
 
 ---
 
-## 12. Where `asyncio` beats threads (and where it doesn't)
+## 12. Where `asyncio` beats threads, and where it doesn't
 
 Threads win here because:
-- The workload is dominated by network I/O; blocking `recv()` is cheap.
+- The workload is dominated by network I/O, and blocking `recv()` is cheap.
 - Every dependency (`requests`, stdlib `RobotFileParser`, `HTMLParser`) is
-  synchronous — mixing sync-in-async without pooling defeats the point.
-- Debugging and testing threaded code with proper locks is well-understood.
+  synchronous. Mixing sync-in-async without pooling defeats the point.
+- Debugging and testing threaded code with proper locks is well understood.
 
 `asyncio` starts to pay off when you want tens of thousands of concurrent
-in-flight requests per process (threads run out of stack RAM around 10k)
-and you're willing to move the whole stack to async (`aiohttp`, an async
-robots impl, an executor for CPU-bound parsing). For a single-machine
+in-flight requests per process (threads run out of stack RAM around 10k) and
+you're willing to move the whole stack to async (`aiohttp`, an async robots
+implementation, an executor for CPU-bound parsing). For a single-machine
 crawler up to ~10^6 URLs, threads are the simpler correct choice.
